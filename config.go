@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -16,9 +17,9 @@ import (
 
 // Map holds all configuration entries
 type Map struct {
-	sources []Source
-	ready   chan struct{}
-	bus     eventBus
+	source Source
+	ready  chan struct{}
+	bus    eventBus
 
 	entriesMtx sync.RWMutex
 	entries    map[string]string
@@ -32,8 +33,12 @@ type Source interface {
 // New returns a new Map.
 // Map periodically loads entries from the provided sources
 func New(sources ...Source) (*Map, proc.Runner) {
+	if len(sources) == 0 {
+		sources = append(sources, Database())
+	}
+
 	m := &Map{
-		sources: sources,
+		source:  Multi(sources...),
 		ready:   make(chan struct{}),
 		entries: make(map[string]string),
 	}
@@ -41,6 +46,7 @@ func New(sources ...Source) (*Map, proc.Runner) {
 	return m, m.runner
 }
 
+// Get value for key
 func (m *Map) Get(key string) string {
 	m.entriesMtx.RLock()
 	defer m.entriesMtx.RUnlock()
@@ -87,19 +93,12 @@ func (m *Map) runner(ctx context.Context) <-chan error {
 func (m *Map) update() error {
 	var (
 		oldMap  = m.entries
-		newMap  = make(map[string]string, len(oldMap))
 		changes []string
 	)
 
-	for _, source := range m.sources {
-		layer, err := source.Read()
-		if err != nil {
-			return err
-		}
-
-		for k, v := range layer {
-			newMap[k] = v
-		}
+	newMap, err := m.source.Read()
+	if err != nil {
+		return err
 	}
 
 	for k, a := range oldMap {
@@ -251,94 +250,237 @@ func dedeupStrings(s []string) []string {
 
 // Prefix all entry keys with a given prefix
 func Prefix(prefix string, s Source) Source {
-	return &prefixSource{
-		prefix: prefix,
-		s:      s,
-	}
-}
+	return SourceFunc(func() (map[string]string, error) {
+		m, err := s.Read()
+		if err != nil {
+			return nil, err
+		}
+		if m == nil {
+			return nil, nil
+		}
 
-type prefixSource struct {
-	prefix string
-	s      Source
-}
-
-func (s *prefixSource) Read() (map[string]string, error) {
-	m, err := s.s.Read()
-	if err != nil {
-		return nil, err
-	}
-
-	o := make(map[string]string, len(m))
-	for k, v := range m {
-		o[s.prefix+k] = v
-	}
-	return o, nil
+		o := make(map[string]string, len(m))
+		for k, v := range m {
+			o[prefix+k] = v
+		}
+		return o, nil
+	})
 }
 
 // Static provides static configuration. This can be used for default and
 // override layers.
 func Static(v map[string]string) Source {
-	if v == nil {
-		v = make(map[string]string)
-	}
-	return &staticSource{e: v}
-}
-
-type staticSource struct {
-	e map[string]string
-}
-
-func (s *staticSource) Read() (map[string]string, error) {
-	return s.e, nil
-}
-
-// Dir loads entries from a directory.
-// One file per entry is expected.
-func Dir(name string) Source {
-	return &dirSource{name: name}
+	return SourceFunc(func() (map[string]string, error) {
+		return v, nil
+	})
 }
 
 var dirSourceEntryNameRE = regexp.MustCompile(`^\.?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
 
-type dirSource struct {
-	name string
-}
-
-func (s *dirSource) Read() (map[string]string, error) {
-	fis, err := ioutil.ReadDir(s.name)
-	if os.IsNotExist(err) {
-		return map[string]string{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	m := make(map[string]string, len(fis))
-
-	for _, fi := range fis {
-		if !fi.Mode().IsRegular() {
-			if fi.Mode()&os.ModeSymlink == 0 {
-				continue
-			}
+// Dir loads entries from a directory.
+// One file per entry is expected.
+func Dir(dirname string) Source {
+	return SourceFunc(func() (map[string]string, error) {
+		entries, err := ioutil.ReadDir(dirname)
+		if os.IsNotExist(err) || os.IsPermission(err) {
+			return nil, nil
 		}
-
-		path := filepath.Join(s.name, fi.Name())
-		name := filepath.Base(fi.Name())
-		// ignore system files: .DS_Store
-		if name == ".DS_Store" {
-			continue
-		}
-		if len(name) > 253 || !dirSourceEntryNameRE.MatchString(name) {
-			continue
-		}
-
-		data, err := ioutil.ReadFile(path)
 		if err != nil {
 			return nil, err
 		}
 
-		m[name] = strings.TrimSpace(string(data))
-	}
+		m := make(map[string]string, len(entries))
 
-	return m, nil
+		for _, entry := range entries {
+			entryPath := filepath.Join(dirname, entry.Name())
+			entryName := filepath.Base(entry.Name())
+			fi, err := os.Stat(entryPath)
+			if os.IsNotExist(err) || os.IsPermission(err) {
+				continue
+			}
+			if !fi.Mode().IsRegular() {
+				continue
+			}
+
+			// ignore system files: .DS_Store
+			if entryName == ".DS_Store" {
+				continue
+			}
+			if len(entryName) > 253 || !dirSourceEntryNameRE.MatchString(entryName) {
+				continue
+			}
+
+			data, err := ioutil.ReadFile(entryPath)
+			if err != nil {
+				return nil, err
+			}
+
+			m[entryName] = strings.TrimSpace(string(data))
+		}
+
+		return m, nil
+	})
+}
+
+type SourceFunc func() (map[string]string, error)
+
+func (f SourceFunc) Read() (map[string]string, error) {
+	return f()
+}
+
+// Multi loads entries from multiple sources
+func Multi(sources ...Source) Source {
+	return SourceFunc(func() (map[string]string, error) {
+		var m = make(map[string]string)
+
+		for _, source := range sources {
+			layer, err := source.Read()
+			if err != nil {
+				return nil, err
+			}
+
+			if layer == nil {
+				continue
+			}
+
+			for k, v := range layer {
+				m[k] = v
+			}
+		}
+
+		return m, nil
+	})
+}
+
+// Database loads entries from .config and /etc/database
+func Database() Source {
+	return SourceFunc(func() (map[string]string, error) {
+		pwd, err := os.Getwd()
+		if err != nil {
+			pwd = "/"
+		}
+
+		var sources []Source
+
+		{
+			configDir := filepath.Join("/etc/database")
+			fi, err := os.Stat(configDir)
+			if err == nil && fi.IsDir() {
+				sources = append([]Source{databaseDir(configDir)}, sources...)
+			}
+			if os.IsNotExist(err) || os.IsPermission(err) {
+				err = nil
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		for {
+			configDir := filepath.Join(pwd, ".config")
+			fi, err := os.Stat(configDir)
+			if err == nil && fi.IsDir() {
+				sources = append([]Source{databaseDir(configDir)}, sources...)
+			}
+			if os.IsNotExist(err) || os.IsPermission(err) {
+				err = nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			if pwd == "/" {
+				break
+			}
+			pwd = filepath.Dir(pwd)
+		}
+
+		return Multi(sources...).Read()
+	})
+}
+
+func databaseDir(dirname string) Source {
+	return SourceFunc(func() (map[string]string, error) {
+		entries, err := ioutil.ReadDir(dirname)
+		if os.IsNotExist(err) || os.IsPermission(err) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		var sources = make([]Source, 0, len(entries))
+
+		for _, entry := range entries {
+			entryPath := filepath.Join(dirname, entry.Name())
+			entryName := filepath.Base(entry.Name())
+			fi, err := os.Stat(entryPath)
+			if os.IsNotExist(err) || os.IsPermission(err) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			// ignore system files: .DS_Store
+			if entryName == ".DS_Store" {
+				continue
+			}
+			if len(entryName) > 253 || !dirSourceEntryNameRE.MatchString(entryName) {
+				continue
+			}
+
+			if fi.Mode().IsDir() {
+				sources = append(sources, Prefix(entryName, Dir(entryPath)))
+			}
+			if fi.Mode().IsRegular() {
+				sources = append(sources, Prefix(entryName, File(entryPath)))
+			}
+		}
+
+		return Multi(sources...).Read()
+	})
+}
+
+func File(filename string) Source {
+	return SourceFunc(func() (map[string]string, error) {
+		data, err := ioutil.ReadFile(filename)
+		if os.IsNotExist(err) || os.IsPermission(err) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		var m = make(map[string]string)
+
+		for len(data) > 0 {
+			line := data
+			if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
+				line = data[:idx]
+				data = data[idx+1:]
+			} else {
+				data = nil
+			}
+			if len(line) == 0 {
+				continue
+			}
+
+			var (
+				key   = line
+				value []byte
+			)
+
+			if idx := bytes.IndexByte(line, '='); idx >= 0 {
+				key = line[:idx]
+				value = line[idx+1:]
+			}
+			if len(key) == 0 {
+				continue
+			}
+
+			m[string(key)] = string(value)
+		}
+
+		return m, nil
+	})
 }
