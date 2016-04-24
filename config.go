@@ -2,13 +2,16 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"golang.org/x/net/context"
@@ -124,6 +127,20 @@ func (m *Map) update() error {
 	for _, key := range changes {
 		m.bus.send(key)
 	}
+
+	if len(changes) > 0 {
+		var (
+			buf bytes.Buffer
+			w   = tabwriter.NewWriter(&buf, 8, 8, 1, ' ', 0)
+		)
+		buf.WriteString("config changed:\n")
+		for _, k := range changes {
+			fmt.Fprintf(w, "  %v:\t%q\t=> %q\n", k, oldMap[k], newMap[k])
+		}
+		w.Flush()
+		log.Println(buf.String())
+	}
+
 	return nil
 }
 
@@ -430,10 +447,10 @@ func databaseDir(dirname string) Source {
 			}
 
 			if fi.Mode().IsDir() {
-				sources = append(sources, Prefix(entryName, Dir(entryPath)))
+				sources = append(sources, Prefix(entryName+"/", Dir(entryPath)))
 			}
 			if fi.Mode().IsRegular() {
-				sources = append(sources, Prefix(entryName, File(entryPath)))
+				sources = append(sources, Prefix(entryName+"/", File(entryPath)))
 			}
 		}
 
