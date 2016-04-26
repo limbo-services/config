@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/tabwriter"
 	"time"
 
@@ -24,8 +25,7 @@ type Map struct {
 	ready  chan struct{}
 	bus    eventBus
 
-	entriesMtx sync.RWMutex
-	entries    map[string]string
+	entries atomic.Value
 }
 
 // Source must be implemented by configuration sources
@@ -41,9 +41,8 @@ func New(sources ...Source) (*Map, proc.Runner) {
 	}
 
 	m := &Map{
-		source:  Multi(sources...),
-		ready:   make(chan struct{}),
-		entries: make(map[string]string),
+		source: Multi(sources...),
+		ready:  make(chan struct{}),
 	}
 
 	return m, m.runner
@@ -51,16 +50,19 @@ func New(sources ...Source) (*Map, proc.Runner) {
 
 // Get value for key
 func (m *Map) Get(key string) string {
-	m.entriesMtx.RLock()
-	defer m.entriesMtx.RUnlock()
-
-	if m.entries == nil {
+	entries, _ := m.entries.Load().(map[string]string)
+	if entries == nil {
 		return ""
 	}
-	return m.entries[key]
+	return entries[key]
 }
 
 func (m *Map) runner(ctx context.Context) <-chan error {
+	err := m.update(false)
+	if err != nil {
+		return proc.Error(err)
+	}
+
 	out := make(chan error)
 	go func() {
 		defer close(out)
@@ -68,35 +70,30 @@ func (m *Map) runner(ctx context.Context) <-chan error {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
-		err := m.update()
-		if err != nil {
-			out <- err
-			return
-		}
-
 		// trigger Ready
 		close(m.ready)
 
 		for {
 			select {
+			case <-ticker.C:
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				err := m.update()
-				if err != nil {
-					out <- err
-					return
-				}
+			}
+
+			err := m.update(true)
+			if err != nil {
+				out <- err
+				return
 			}
 		}
 	}()
 	return out
 }
 
-func (m *Map) update() error {
+func (m *Map) update(shouldNotify bool) error {
 	var (
-		oldMap  = m.entries
-		changes []string
+		oldMap, _ = m.entries.Load().(map[string]string)
+		changes   []string
 	)
 
 	newMap, err := m.source.Read()
@@ -104,10 +101,12 @@ func (m *Map) update() error {
 		return err
 	}
 
-	for k, a := range oldMap {
-		b := newMap[k]
-		if a != b {
-			changes = append(changes, k)
+	if oldMap != nil {
+		for k, a := range oldMap {
+			b := newMap[k]
+			if a != b {
+				changes = append(changes, k)
+			}
 		}
 	}
 
@@ -120,12 +119,12 @@ func (m *Map) update() error {
 
 	changes = dedeupStrings(changes)
 
-	m.entriesMtx.Lock()
-	m.entries = newMap
-	m.entriesMtx.Unlock()
+	m.entries.Store(newMap)
 
-	for _, key := range changes {
-		m.bus.send(key)
+	if shouldNotify {
+		for _, key := range changes {
+			m.bus.send(key)
+		}
 	}
 
 	if len(changes) > 0 {
